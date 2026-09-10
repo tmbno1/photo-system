@@ -1,9 +1,9 @@
 import streamlit as st
 import os
+import json
 import datetime
 import re
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -22,27 +22,25 @@ SCOPES = [
 ]
 
 def authenticate_google():
-    """處理 Google 帳號授權與 Token 保存"""
-    creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    if not creds or not creds.valid:
+    """從 Streamlit Cloud Secrets 讀取 Google 憑證"""
+    try:
+        # 從雲端 Secrets 讀取憑證資訊
+        token_info = dict(st.secrets["google_oauth"])
+        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+        
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file('client_secret.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-    return creds
+            
+        return creds
+    except Exception as e:
+        st.error(f"❌ Google 驗證失敗，請檢查 Streamlit Secrets 設定。錯誤: {e}")
+        return None
 
 def extract_file_id(url):
-    """從 Google Drive 連結中擷取 File ID"""
     match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
     return match.group(1) if match else None
 
 def check_file_exists(drive_service, file_id):
-    """檢查 Google Drive 檔案是否還存在（未被刪除或移至垃圾桶）"""
     try:
         file = drive_service.files().get(fileId=file_id, fields='trashed').execute()
         return not file.get('trashed', False)
@@ -53,13 +51,16 @@ def main():
     st.set_page_config(page_title="商品攝影建檔系統", page_icon="📸", layout="centered")
     st.title("📦 商品攝影自動建檔系統")
 
+    creds = authenticate_google()
+    if not creds:
+        return
+
     try:
-        creds = authenticate_google()
         drive_service = build('drive', 'v3', credentials=creds)
         gc = gspread.authorize(creds)
         sheet = gc.open_by_key(SHEET_ID).sheet1
     except Exception as e:
-        st.error(f"❌ Google 驗證失敗，請確認 client_secret.json 是否正常。錯誤: {e}")
+        st.error(f"❌ 連線 Google API 失敗: {e}")
         return
 
     tab1, tab2 = st.tabs(["📸 新增商品建檔", "🔄 雲端狀態同步/清理"])
@@ -119,13 +120,13 @@ def main():
                     except Exception as e:
                         st.error(f"❌ 發生錯誤: {e}")
 
-    # ---------------- 頁籤 2: 逐張精密檢查與同步 ----------------
+    # ---------------- 頁籤 2: 雲端狀態同步/清理 ----------------
     with tab2:
         st.markdown("### 🧹 雲端照片精密同步")
-        st.write("系統會逐張比對該商品的所有圖片。若部分照片被手動刪除，會自動更新剩餘連結與數量；若照片全數被刪除，則移除該商品紀錄。")
+        st.write("系統會逐張比對該商品的所有圖片狀態。")
         
         if st.button("🔄 開始逐張檢查與同步"):
-            with st.spinner("🔍 正在全面檢查所有圖片狀態，請稍候... (此過程可能需要幾十秒)"):
+            with st.spinner("🔍 正在檢查所有圖片狀態..."):
                 try:
                     rows = sheet.get_all_values()
                     if len(rows) <= 1:
@@ -153,21 +154,20 @@ def main():
                                 
                                 if len(valid_links) != original_valid_count:
                                     changed_count += 1
-                                    
                                     if len(valid_links) == 0:
                                         sheet.delete_rows(index)
                                         deleted_rows_count += 1
-                                        st.warning(f"🗑️ 商品 **{sku}** 照片已全數被刪除，已移除整筆建檔紀錄。")
+                                        st.warning(f"🗑️ 商品 **{sku}** 照片已全數被刪除，已移除整筆紀錄。")
                                     else:
                                         sheet.batch_clear([f"A{index}:Z{index}"])
                                         new_row = [date_str, sku, prefix, len(valid_links)] + valid_links
                                         sheet.update(range_name=f"A{index}", values=[new_row])
-                                        st.info(f"✏️ 商品 **{sku}** 照片數量由 {original_valid_count} 張變更為 {len(valid_links)} 張（已重新排序連結）。")
+                                        st.info(f"✏️ 商品 **{sku}** 照片已更新剩餘 {len(valid_links)} 張。")
                         
                         if changed_count == 0:
                             st.success("✅ 檢查完畢！所有商品的照片連結皆完整存在。")
                         else:
-                            st.success(f"🎉 同步完成！共修正 {changed_count} 筆紀錄（包含移除 {deleted_rows_count} 筆已無照片的商品）。")
+                            st.success(f"🎉 同步完成！共修正 {changed_count} 筆紀錄。")
                 except Exception as e:
                     st.error(f"檢查時發生錯誤: {e}")
 
